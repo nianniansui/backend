@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from pydantic import BaseModel
+from uuid import UUID
 import logging
 
 from app.db.database import get_db
@@ -31,6 +32,18 @@ class SearchRequest(BaseModel):
 class SearchResponse(BaseModel):
     answer: str
     sources: list[MemoryOut]
+
+
+class MemoryUpdate(BaseModel):
+    summary: str | None = None
+    raw_text: str | None = None
+
+
+def _parse_uuid(memory_id: str) -> UUID:
+    try:
+        return UUID(memory_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid memory id")
 
 
 @router.post("/add_memory", response_model=MemoryOut)
@@ -83,15 +96,20 @@ async def add_memory(
 async def list_memories(
     user_id: str = "default",
     limit: int = 20,
+    before: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """按时间倒序返回记忆流"""
-    result = await db.execute(
-        select(Memory)
-        .where(Memory.user_id == user_id)
-        .order_by(Memory.created_at.desc())
-        .limit(limit)
-    )
+    """按时间倒序返回记忆流，支持 `before=<created_at ISO>` 游标分页。"""
+    stmt = select(Memory).where(Memory.user_id == user_id)
+    if before:
+        from datetime import datetime
+        try:
+            cutoff = datetime.fromisoformat(before.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid `before` timestamp")
+        stmt = stmt.where(Memory.created_at < cutoff)
+    stmt = stmt.order_by(Memory.created_at.desc()).limit(limit)
+    result = await db.execute(stmt)
     memories = result.scalars().all()
     return [
         MemoryOut(
@@ -102,6 +120,61 @@ async def list_memories(
         )
         for m in memories
     ]
+
+
+@router.delete("/memories/{memory_id}")
+async def delete_memory(
+    memory_id: str,
+    user_id: str = "default",
+    db: AsyncSession = Depends(get_db),
+):
+    uid = _parse_uuid(memory_id)
+    result = await db.execute(
+        select(Memory).where(Memory.id == uid, Memory.user_id == user_id)
+    )
+    mem = result.scalar_one_or_none()
+    if mem is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    await db.delete(mem)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.patch("/memories/{memory_id}", response_model=MemoryOut)
+async def update_memory(
+    memory_id: str,
+    payload: MemoryUpdate,
+    user_id: str = "default",
+    db: AsyncSession = Depends(get_db),
+):
+    uid = _parse_uuid(memory_id)
+    result = await db.execute(
+        select(Memory).where(Memory.id == uid, Memory.user_id == user_id)
+    )
+    mem = result.scalar_one_or_none()
+    if mem is None:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    changed = False
+    if payload.summary is not None:
+        mem.summary = payload.summary.strip()
+        changed = True
+    if payload.raw_text is not None and payload.raw_text.strip():
+        mem.raw_text = payload.raw_text.strip()
+        # 改正后的文本需要重算向量，保证搜索准确
+        mem.embedding = await embed_text(mem.raw_text)
+        changed = True
+
+    if changed:
+        await db.commit()
+        await db.refresh(mem)
+
+    return MemoryOut(
+        id=str(mem.id),
+        raw_text=mem.raw_text,
+        summary=mem.summary,
+        created_at=mem.created_at.isoformat(),
+    )
 
 
 @router.post("/search", response_model=SearchResponse)
