@@ -39,6 +39,11 @@ class MemoryUpdate(BaseModel):
     raw_text: str | None = None
 
 
+class TextMemoryRequest(BaseModel):
+    text: str
+    user_id: str = "default"
+
+
 def _parse_uuid(memory_id: str) -> UUID:
     try:
         return UUID(memory_id)
@@ -76,6 +81,40 @@ async def add_memory(
     # 3. 存入数据库
     memory = Memory(
         user_id=user_id,
+        raw_text=raw_text,
+        summary=summary,
+        embedding=embedding,
+    )
+    db.add(memory)
+    await db.commit()
+    await db.refresh(memory)
+
+    return MemoryOut(
+        id=str(memory.id),
+        raw_text=memory.raw_text,
+        summary=memory.summary,
+        created_at=memory.created_at.isoformat(),
+    )
+
+
+@router.post("/add_memory_text", response_model=MemoryOut)
+async def add_memory_text(
+    req: TextMemoryRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """直接接收文字（来自 Share Extension / 系统分享），跳过 STT。"""
+    raw_text = req.text.strip()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="文本为空")
+
+    import asyncio
+    summary, embedding = await asyncio.gather(
+        summarize_memory(raw_text),
+        embed_text(raw_text),
+    )
+
+    memory = Memory(
+        user_id=req.user_id,
         raw_text=raw_text,
         summary=summary,
         embedding=embedding,
