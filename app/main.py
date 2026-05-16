@@ -1,9 +1,13 @@
 import logging
+import os
+from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from app.api.v1.memory import router as memory_router
+from app.db.database import engine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,6 +29,31 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                  f"content-type={request.headers.get('content-type')} | "
                  f"body_size={len(body)} | errors={exc.errors()}")
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.on_event("startup")
+async def run_migrations():
+    """启动时跑迁移目录里所有 SQL，幂等。
+    这样部署到生产时不需要手动连库执行 SQL —— 直接 docker compose up -d --build 就行。
+    """
+    if os.getenv("SKIP_MIGRATIONS") == "1":
+        return
+    migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
+    if not migrations_dir.is_dir():
+        logger.info("migrations dir not found at %s, skip", migrations_dir)
+        return
+    files = sorted(p for p in migrations_dir.glob("*.sql"))
+    if not files:
+        return
+    async with engine.begin() as conn:
+        for f in files:
+            sql = f.read_text(encoding="utf-8")
+            logger.info("running migration: %s", f.name)
+            try:
+                await conn.execute(text(sql))
+            except Exception as e:
+                # 幂等 SQL 应当用 IF NOT EXISTS；偶发"已存在"错误吞掉就行
+                logger.warning("migration %s warning: %s", f.name, e)
 
 
 app.include_router(memory_router)

@@ -3,11 +3,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from pydantic import BaseModel
 from uuid import UUID
+from datetime import datetime, timezone, timedelta
 import logging
 
 from app.db.database import get_db
 from app.models.memory import Memory
-from app.services.ai_service import transcribe_audio, embed_text, summarize_memory
+from app.models.reminder import Reminder
+from app.services.ai_service import (
+    transcribe_audio,
+    embed_text,
+    summarize_memory,
+    extract_reminder,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["memory"])
 logger = logging.getLogger(__name__)
@@ -44,11 +51,72 @@ class TextMemoryRequest(BaseModel):
     user_id: str = "default"
 
 
+class ReminderOut(BaseModel):
+    id: str
+    memory_id: str
+    title: str
+    trigger_at: str  # ISO8601 with TZ
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class RecapOut(BaseModel):
+    """每日摘要：选一条历史记忆推到用户面前"""
+    memory_id: str | None
+    title: str        # "3 天前你说过：…"
+    body: str         # 记忆原文或摘要
+    created_at: str | None  # 原记忆的时间
+
+
 def _parse_uuid(memory_id: str) -> UUID:
     try:
         return UUID(memory_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid memory id")
+
+
+def _parse_iso(iso_str: str) -> datetime | None:
+    """容错地解析 LLM 返回的 ISO 时间，失败返回 None"""
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # LLM 偶尔忘带 tz，认作东八区
+            dt = dt.replace(tzinfo=timezone(timedelta(hours=8)))
+        return dt
+    except (ValueError, TypeError):
+        logger.warning("could not parse trigger_at: %r", iso_str)
+        return None
+
+
+async def _try_extract_and_save_reminder(
+    db: AsyncSession, memory: Memory, raw_text: str
+) -> None:
+    """录入后异步抽提醒。失败不影响主流程。"""
+    try:
+        now_iso = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+        result = await extract_reminder(raw_text, now_iso=now_iso)
+        if not result:
+            return
+        trigger_at = _parse_iso(result.get("trigger_at"))
+        if trigger_at is None:
+            return
+        if trigger_at <= datetime.now(timezone.utc):
+            return  # 时间已过，不建提醒
+        reminder = Reminder(
+            user_id=memory.user_id,
+            memory_id=memory.id,
+            trigger_at=trigger_at,
+            title=(result.get("title") or "")[:200],
+        )
+        db.add(reminder)
+        await db.commit()
+        logger.info("reminder created for memory %s at %s", memory.id, trigger_at)
+    except Exception as e:
+        logger.warning("extract_reminder failed (non-fatal): %s", e)
 
 
 @router.post("/add_memory", response_model=MemoryOut)
@@ -89,6 +157,9 @@ async def add_memory(
     await db.commit()
     await db.refresh(memory)
 
+    # 4. 抽提醒（失败不影响主流程）
+    await _try_extract_and_save_reminder(db, memory, raw_text)
+
     return MemoryOut(
         id=str(memory.id),
         raw_text=memory.raw_text,
@@ -122,6 +193,8 @@ async def add_memory_text(
     db.add(memory)
     await db.commit()
     await db.refresh(memory)
+
+    await _try_extract_and_save_reminder(db, memory, raw_text)
 
     return MemoryOut(
         id=str(memory.id),
@@ -295,3 +368,105 @@ async def search_memory(req: SearchRequest, db: AsyncSession = Depends(get_db)):
         for r in sorted_candidates
     ]
     return SearchResponse(answer=answer, sources=sources)
+
+
+@router.get("/reminders/upcoming", response_model=list[ReminderOut])
+async def list_upcoming_reminders(
+    user_id: str = "default",
+    days: int = 7,
+    db: AsyncSession = Depends(get_db),
+):
+    """返回未来 N 天内待提醒的事件，App 启动时一次性同步并预定到本地通知。"""
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(days=max(1, min(days, 30)))
+    result = await db.execute(
+        select(Reminder)
+        .where(
+            Reminder.user_id == user_id,
+            Reminder.trigger_at >= now,
+            Reminder.trigger_at <= until,
+        )
+        .order_by(Reminder.trigger_at.asc())
+    )
+    rows = result.scalars().all()
+    return [
+        ReminderOut(
+            id=str(r.id),
+            memory_id=str(r.memory_id),
+            title=r.title,
+            trigger_at=r.trigger_at.isoformat(),
+            created_at=r.created_at.isoformat(),
+        )
+        for r in rows
+    ]
+
+
+@router.get("/recap/today", response_model=RecapOut)
+async def recap_today(
+    user_id: str = "default",
+    db: AsyncSession = Depends(get_db),
+):
+    """每日摘要：从用户历史记忆中挑一条值得回看的，给本地通知用。
+
+    挑选策略（无 LLM 也能跑）：
+    1. 1 个月前的今天附近的记忆（"上月今天"）
+    2. 1 周前的今天附近的记忆（"上周同一天"）
+    3. 一年前今天附近的记忆
+    4. 都没有时，挑最早一条（让用户感受到沉淀）
+    返回的 title 由前端组装文案，body 是记忆原文/摘要。
+    """
+    from datetime import date as _date
+
+    # 候选偏移：天数 → 文案前缀
+    offsets = [(30, "1 个月前的今天"), (7, "1 周前的今天"), (365, "1 年前的今天")]
+    today_utc = datetime.now(timezone.utc)
+
+    for days_back, prefix in offsets:
+        target = today_utc - timedelta(days=days_back)
+        # 在目标日 ±1 天范围内挑
+        lo = target - timedelta(days=1)
+        hi = target + timedelta(days=1)
+        result = await db.execute(
+            select(Memory)
+            .where(
+                Memory.user_id == user_id,
+                Memory.created_at >= lo,
+                Memory.created_at <= hi,
+            )
+            .order_by(Memory.created_at.asc())
+            .limit(1)
+        )
+        m = result.scalar_one_or_none()
+        if m:
+            body = (m.summary or m.raw_text or "").strip()
+            return RecapOut(
+                memory_id=str(m.id),
+                title=f"{prefix}你说过",
+                body=body[:120],
+                created_at=m.created_at.isoformat(),
+            )
+
+    # 兜底：最早一条
+    result = await db.execute(
+        select(Memory)
+        .where(Memory.user_id == user_id)
+        .order_by(Memory.created_at.asc())
+        .limit(1)
+    )
+    m = result.scalar_one_or_none()
+    if m:
+        body = (m.summary or m.raw_text or "").strip()
+        return RecapOut(
+            memory_id=str(m.id),
+            title="翻翻第一条记忆",
+            body=body[:120],
+            created_at=m.created_at.isoformat(),
+        )
+
+    # 完全没有记录
+    return RecapOut(
+        memory_id=None,
+        title="还没有记忆呢",
+        body="按住中间的按钮，随口一记。",
+        created_at=None,
+    )

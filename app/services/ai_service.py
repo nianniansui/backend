@@ -134,3 +134,61 @@ async def summarize_memory(text: str) -> str:
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+async def extract_reminder(text: str, now_iso: str) -> dict | None:
+    """从用户的口语化记忆里抽出"将来要发生的事"。
+    返回 {trigger_at: ISO8601, title: str} 或 None（没有时间信息时）。
+    `now_iso` 由调用方传入，让 LLM 解算 "明天" / "下周三" 之类相对时间。
+    """
+    import json
+
+    system = (
+        "你从用户记录里抽取需要提醒的未来事件。\n"
+        f"当前时间：{now_iso}（ISO8601）。\n"
+        "如果记录中包含一个明确指向未来的时间或日期，输出 JSON：\n"
+        '{"trigger_at": "YYYY-MM-DDTHH:MM:SS+08:00", "title": "<不超过 30 字、给用户看的事件描述>"}\n'
+        "规则：\n"
+        "1. 没有任何时间信息（纯日记/物品定位等）时，返回 {\"trigger_at\": null}。\n"
+        "2. 时间已过（早于当前时间）时也返回 {\"trigger_at\": null}。\n"
+        "3. 只有日期没有时间时，默认设为当天 09:00。\n"
+        "4. 模糊时段：'早上'=09:00、'上午'=10:00、'中午'=12:00、'下午'=15:00、'晚上'=20:00。\n"
+        "5. 必须返回合法 JSON，不要任何解释。"
+    )
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{settings.LLM_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": settings.LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+                "max_tokens": 100,
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("extract_reminder: bad JSON from LLM: %r", raw)
+        return None
+
+    trigger_at = data.get("trigger_at")
+    if not trigger_at:
+        return None
+    title = (data.get("title") or "").strip()
+    if not title:
+        # title 退化为原文前 30 字，保证下游不空
+        title = text.strip().splitlines()[0][:30]
+    return {"trigger_at": trigger_at, "title": title}
