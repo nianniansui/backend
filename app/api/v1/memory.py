@@ -119,6 +119,19 @@ async def _try_extract_and_save_reminder(
         logger.warning("extract_reminder failed (non-fatal): %s", e)
 
 
+@router.post("/transcribe")
+async def transcribe_only(
+    audio: UploadFile = File(...),
+    user_id: str = Form(default="default"),
+):
+    """仅做 STT 转写，不存入记忆。用于搜索页语音提问。"""
+    audio_bytes = await audio.read()
+    if len(audio_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+    raw_text = await transcribe_audio(audio_bytes, audio.content_type or "audio/wav")
+    return {"text": raw_text.strip()}
+
+
 @router.post("/add_memory", response_model=MemoryOut)
 async def add_memory(
     audio: UploadFile = File(...),
