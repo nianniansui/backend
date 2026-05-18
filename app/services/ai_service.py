@@ -10,6 +10,39 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+# 共享的 httpx client：避免每次请求都做 TCP/TLS 握手。
+# 由 lifespan event 管理生命周期；这里只声明，初始化和关闭在 main.py 里。
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """获取共享 httpx client。未初始化时 fallback 到一次性 client。"""
+    global _http_client
+    if _http_client is None:
+        # lifespan 没启动（比如单元测试），用临时 client，性能略差但功能正常
+        _http_client = httpx.AsyncClient(
+            timeout=30,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
+    return _http_client
+
+
+async def init_http_client() -> None:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=30,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
+
+
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+
 def _parse_wav_header(data: bytes) -> dict:
     """解析 WAV 文件头，返回格式信息"""
     if len(data) < 44 or data[:4] != b'RIFF':
@@ -68,10 +101,10 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/wav") -> 
         logger.info(f"STT text (inline): '{text}'")
         return text
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(transcription_url, timeout=15)
-        r.raise_for_status()
-        data = r.json()
+    client = get_http_client()
+    r = await client.get(transcription_url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
 
     logger.info(f"transcription_url content keys: {list(data.keys())}")
     transcripts = data.get("transcripts", [])
@@ -88,52 +121,61 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/wav") -> 
 
 async def embed_text(text: str) -> list[float]:
     """调用通义千问 Embedding 将文本向量化"""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
-            headers={
-                "Authorization": f"Bearer {settings.DASHSCOPE_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.DASHSCOPE_EMBEDDING_MODEL,
-                "input": {"texts": [text]},
-                "parameters": {"text_type": "document"},
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()["output"]["embeddings"][0]["embedding"]
+    client = get_http_client()
+    resp = await client.post(
+        "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
+        headers={
+            "Authorization": f"Bearer {settings.DASHSCOPE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": settings.DASHSCOPE_EMBEDDING_MODEL,
+            "input": {"texts": [text]},
+            "parameters": {"text_type": "document"},
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["output"]["embeddings"][0]["embedding"]
 
 
 async def summarize_memory(text: str) -> str:
-    """用 DeepSeek 提炼记忆摘要"""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{settings.LLM_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.LLM_MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是一个记忆提炼助手。将用户的口语化记录提炼成简洁的第三人称摘要，"
-                            "保留关键实体（物品、地点、人物）和动作，不超过50字。"
-                        ),
-                    },
-                    {"role": "user", "content": text},
-                ],
-                "max_tokens": 100,
-                "temperature": 0.3,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+    """用 DeepSeek 提炼记忆摘要。
+
+    短文本直接返回原文，省一次 LLM 调用（~1s + 一笔 token 费用）。
+    阈值 30 字是经验值：典型短句"剪刀放在抽屉里"=8 字，"下周三 3 点和王老师开会"=12 字，
+    都不需要再提炼了。
+    """
+    stripped = text.strip()
+    if len(stripped) < 30:
+        return stripped
+
+    client = get_http_client()
+    resp = await client.post(
+        f"{settings.LLM_BASE_URL}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": settings.LLM_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个记忆提炼助手。将用户的口语化记录提炼成简洁的第三人称摘要，"
+                        "保留关键实体（物品、地点、人物）和动作，不超过50字。"
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            "max_tokens": 100,
+            "temperature": 0.3,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 async def extract_reminder(text: str, now_iso: str) -> dict | None:
@@ -156,27 +198,27 @@ async def extract_reminder(text: str, now_iso: str) -> dict | None:
         "5. 必须返回合法 JSON，不要任何解释。"
     )
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{settings.LLM_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": text},
-                ],
-                "max_tokens": 100,
-                "temperature": 0.0,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+    client = get_http_client()
+    resp = await client.post(
+        f"{settings.LLM_BASE_URL}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": settings.LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+            "max_tokens": 100,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
 
     try:
         data = json.loads(raw)

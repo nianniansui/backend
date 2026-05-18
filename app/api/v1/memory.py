@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from pydantic import BaseModel
@@ -6,7 +6,7 @@ from uuid import UUID
 from datetime import datetime, timezone, timedelta
 import logging
 
-from app.db.database import get_db
+from app.db.database import get_db, AsyncSessionLocal
 from app.models.memory import Memory
 from app.models.reminder import Reminder
 from app.services.ai_service import (
@@ -93,9 +93,12 @@ def _parse_iso(iso_str: str) -> datetime | None:
 
 
 async def _try_extract_and_save_reminder(
-    db: AsyncSession, memory: Memory, raw_text: str
+    memory_id: UUID, user_id: str, raw_text: str
 ) -> None:
-    """录入后异步抽提醒。失败不影响主流程。"""
+    """后台任务：抽提醒并写入。失败不影响主流程。
+
+    HTTP 响应已经返回给客户端了，这里用独立 session 跑，不阻塞用户。
+    """
     try:
         now_iso = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
         result = await extract_reminder(raw_text, now_iso=now_iso)
@@ -106,15 +109,16 @@ async def _try_extract_and_save_reminder(
             return
         if trigger_at <= datetime.now(timezone.utc):
             return  # 时间已过，不建提醒
-        reminder = Reminder(
-            user_id=memory.user_id,
-            memory_id=memory.id,
-            trigger_at=trigger_at,
-            title=(result.get("title") or "")[:200],
-        )
-        db.add(reminder)
-        await db.commit()
-        logger.info("reminder created for memory %s at %s", memory.id, trigger_at)
+        async with AsyncSessionLocal() as session:
+            reminder = Reminder(
+                user_id=user_id,
+                memory_id=memory_id,
+                trigger_at=trigger_at,
+                title=(result.get("title") or "")[:200],
+            )
+            session.add(reminder)
+            await session.commit()
+        logger.info("reminder created for memory %s at %s", memory_id, trigger_at)
     except Exception as e:
         logger.warning("extract_reminder failed (non-fatal): %s", e)
 
@@ -134,6 +138,7 @@ async def transcribe_only(
 
 @router.post("/add_memory", response_model=MemoryOut)
 async def add_memory(
+    background_tasks: BackgroundTasks,
     audio: UploadFile = File(...),
     user_id: str = Form(default="default"),
     db: AsyncSession = Depends(get_db),
@@ -170,8 +175,10 @@ async def add_memory(
     await db.commit()
     await db.refresh(memory)
 
-    # 4. 抽提醒（失败不影响主流程）
-    await _try_extract_and_save_reminder(db, memory, raw_text)
+    # 4. 抽提醒走后台任务，HTTP 直接返回不再等
+    background_tasks.add_task(
+        _try_extract_and_save_reminder, memory.id, user_id, raw_text
+    )
 
     return MemoryOut(
         id=str(memory.id),
@@ -184,6 +191,7 @@ async def add_memory(
 @router.post("/add_memory_text", response_model=MemoryOut)
 async def add_memory_text(
     req: TextMemoryRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """直接接收文字（来自 Share Extension / 系统分享），跳过 STT。"""
@@ -207,7 +215,9 @@ async def add_memory_text(
     await db.commit()
     await db.refresh(memory)
 
-    await _try_extract_and_save_reminder(db, memory, raw_text)
+    background_tasks.add_task(
+        _try_extract_and_save_reminder, memory.id, req.user_id, raw_text
+    )
 
     return MemoryOut(
         id=str(memory.id),

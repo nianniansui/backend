@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from app.api.v1.memory import router as memory_router
 from app.db.database import engine
+from app.services.ai_service import init_http_client, close_http_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,10 +33,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 @app.on_event("startup")
-async def run_migrations():
-    """启动时跑迁移目录里所有 SQL，幂等。
-    这样部署到生产时不需要手动连库执行 SQL —— 直接 docker compose up -d --build 就行。
-    """
+async def on_startup():
+    """启动时：初始化共享 httpx client + 跑迁移目录里所有 SQL（幂等）。"""
+    await init_http_client()
     if os.getenv("SKIP_MIGRATIONS") == "1":
         return
     migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
@@ -56,9 +56,15 @@ async def run_migrations():
                 logger.warning("migration %s warning: %s", f.name, e)
 
 
+@app.on_event("shutdown")
+async def on_shutdown():
+    await close_http_client()
+
+
 app.include_router(memory_router)
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+

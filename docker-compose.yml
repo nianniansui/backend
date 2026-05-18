@@ -11,6 +11,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
       - ./migrations/002_reminders.sql:/docker-entrypoint-initdb.d/002_reminders.sql
+      - ./migrations/003_hnsw_index.sql:/docker-entrypoint-initdb.d/003_hnsw_index.sql
 
   api:
     build: .
